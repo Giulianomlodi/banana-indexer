@@ -33,14 +33,12 @@ const Token = mongoose.model("Token", TokenSchema);
 const Transfer = mongoose.model("Transfer", TransferSchema);
 const FailedEvent = mongoose.model("FailedEvent", FailedEventSchema);
 
-// Contract interface
 const contractABI = [
   "event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)",
   "function totalSupply() view returns (uint256)",
   "function ownerOf(uint256 tokenId) view returns (address)",
 ];
 
-// Create indexes for better query performance
 async function createIndexes() {
   await Token.collection.createIndex({ currentOwner: 1 });
   await Transfer.collection.createIndex({ blockNumber: -1 });
@@ -54,7 +52,6 @@ async function startIndexing() {
 
   while (true) {
     try {
-      // Connect to MongoDB with retry options
       await mongoose.connect(process.env.MONGODB_URI, {
         serverSelectionTimeoutMS: 5000,
         retryWrites: true,
@@ -64,11 +61,28 @@ async function startIndexing() {
       console.log("Connected to MongoDB");
       await createIndexes();
 
-      // Initialize provider with timeout and retry options
-      provider = new ethers.JsonRpcProvider(process.env.RPC_URL, {
-        timeout: 30000,
-        retryCount: 3,
-        maxRetries: 5,
+      // Fixed provider initialization
+      provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
+
+      // Configure provider settings
+      provider.pollingInterval = 4000;
+      provider.getTransactionReceipt.retryCount = 3;
+      provider.getTransaction.retryCount = 3;
+      provider.getLogs.retryCount = 3;
+      provider.getBlock.retryCount = 3;
+      provider.getBlockNumber.retryCount = 3;
+
+      // Add timeout wrapper
+      const TIMEOUT = 30000;
+      provider.perform = new Proxy(provider.perform, {
+        apply: (target, thisArg, args) => {
+          return Promise.race([
+            target.apply(thisArg, args),
+            new Promise((_, reject) =>
+              setTimeout(() => reject(new Error("RPC Timeout")), TIMEOUT)
+            ),
+          ]);
+        },
       });
 
       contract = new ethers.Contract(
@@ -77,11 +91,9 @@ async function startIndexing() {
         provider
       );
 
-      // Get last processed block
       const lastTransfer = await Transfer.findOne().sort({ blockNumber: -1 });
       const startBlock = lastTransfer ? lastTransfer.blockNumber + 1 : 0;
 
-      // Index historical events in chunks
       const latestBlock = await provider.getBlockNumber();
       const CHUNK_SIZE = 2000;
 
@@ -90,17 +102,13 @@ async function startIndexing() {
         await indexHistoricalEvents(contract, from, to);
       }
 
-      // Set up event listener with reconnection logic
       setupEventListener(contract);
-
-      // Start periodic tasks
       startPeriodicTasks(contract);
 
-      break; // Exit loop if successful
+      break;
     } catch (error) {
       console.error("Critical error in startIndexing:", error);
       await cleanup();
-      // Wait before retrying
       await new Promise((resolve) => setTimeout(resolve, 10000));
     }
   }
@@ -116,7 +124,6 @@ function setupEventListener(contract) {
     }
   });
 
-  // Handle provider disconnections
   contract.provider.on("error", async (error) => {
     console.error("Provider error:", error);
     await cleanup();
@@ -125,12 +132,10 @@ function setupEventListener(contract) {
 }
 
 function startPeriodicTasks(contract) {
-  // Validate and repair data hourly
   setInterval(async () => {
     await validateAndRepairData(contract);
   }, 3600000);
 
-  // Retry failed events every 5 minutes
   setInterval(async () => {
     await retryFailedEvents(contract);
   }, 300000);
@@ -220,7 +225,7 @@ async function storeFailedEvent(from, to, tokenId, event, error) {
 async function retryFailedEvents(contract) {
   const failedEvents = await FailedEvent.find({
     retryCount: { $lt: 3 },
-    timestamp: { $lt: new Date(Date.now() - 300000) }, // 5 minutes old
+    timestamp: { $lt: new Date(Date.now() - 300000) },
   });
 
   for (const event of failedEvents) {
@@ -257,7 +262,7 @@ async function validateAndRepairData(contract) {
           { tokenId },
           {
             currentOwner: onchainOwner.toLowerCase(),
-            lastTransferBlock: await provider.getBlockNumber(),
+            lastTransferBlock: await contract.provider.getBlockNumber(),
           },
           { upsert: true }
         );
@@ -284,7 +289,6 @@ async function cleanup() {
   }
 }
 
-// Graceful shutdown
 process.on("SIGINT", async () => {
   console.log("Shutting down gracefully...");
   await cleanup();
