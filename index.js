@@ -61,29 +61,13 @@ async function startIndexing() {
       console.log("Connected to MongoDB");
       await createIndexes();
 
-      // Fixed provider initialization
+      // Initialize provider without network config
       provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
 
-      // Configure provider settings
-      provider.pollingInterval = 4000;
-      provider.getTransactionReceipt.retryCount = 3;
-      provider.getTransaction.retryCount = 3;
-      provider.getLogs.retryCount = 3;
-      provider.getBlock.retryCount = 3;
-      provider.getBlockNumber.retryCount = 3;
-
-      // Add timeout wrapper
-      const TIMEOUT = 30000;
-      provider.perform = new Proxy(provider.perform, {
-        apply: (target, thisArg, args) => {
-          return Promise.race([
-            target.apply(thisArg, args),
-            new Promise((_, reject) =>
-              setTimeout(() => reject(new Error("RPC Timeout")), TIMEOUT)
-            ),
-          ]);
-        },
-      });
+      // Configure request timeout
+      const timeoutMs = 30000;
+      provider.getNetwork().timeout = timeoutMs;
+      provider.transport.timeout = timeoutMs;
 
       contract = new ethers.Contract(
         process.env.CONTRACT_ADDRESS,
