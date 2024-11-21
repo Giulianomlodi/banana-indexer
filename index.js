@@ -61,13 +61,8 @@ async function startIndexing() {
       console.log("Connected to MongoDB");
       await createIndexes();
 
-      // Initialize provider without network config
+      // Simplified provider initialization
       provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
-
-      // Configure request timeout
-      const timeoutMs = 30000;
-      provider.getNetwork().timeout = timeoutMs;
-      provider.transport.timeout = timeoutMs;
 
       contract = new ethers.Contract(
         process.env.CONTRACT_ADDRESS,
