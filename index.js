@@ -1,4 +1,3 @@
-// index.js
 const { ethers } = require("ethers");
 const mongoose = require("mongoose");
 require("dotenv").config();
@@ -19,85 +18,254 @@ const TransferSchema = new mongoose.Schema({
   timestamp: { type: Date, default: Date.now },
 });
 
+const FailedEventSchema = new mongoose.Schema({
+  tokenId: { type: String, required: true },
+  from: { type: String, required: true },
+  to: { type: String, required: true },
+  blockNumber: { type: Number, required: true },
+  transactionHash: { type: String, required: true },
+  error: { type: String },
+  retryCount: { type: Number, default: 0 },
+  timestamp: { type: Date, default: Date.now },
+});
+
 const Token = mongoose.model("Token", TokenSchema);
 const Transfer = mongoose.model("Transfer", TransferSchema);
+const FailedEvent = mongoose.model("FailedEvent", FailedEventSchema);
 
+// Contract interface
 const contractABI = [
   "event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)",
   "function totalSupply() view returns (uint256)",
+  "function ownerOf(uint256 tokenId) view returns (address)",
 ];
 
+// Create indexes for better query performance
+async function createIndexes() {
+  await Token.collection.createIndex({ currentOwner: 1 });
+  await Transfer.collection.createIndex({ blockNumber: -1 });
+  await Transfer.collection.createIndex({ tokenId: 1 });
+  await FailedEvent.collection.createIndex({ timestamp: 1 });
+}
+
 async function startIndexing() {
-  try {
-    await mongoose.connect(process.env.MONGODB_URI);
-    console.log("Connected to MongoDB");
+  let provider;
+  let contract;
 
-    const provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
-    const contract = new ethers.Contract(
-      process.env.CONTRACT_ADDRESS,
-      contractABI,
-      provider
-    );
+  while (true) {
+    try {
+      // Connect to MongoDB with retry options
+      await mongoose.connect(process.env.MONGODB_URI, {
+        serverSelectionTimeoutMS: 5000,
+        retryWrites: true,
+        maxPoolSize: 10,
+      });
 
-    const lastTransfer = await Transfer.findOne().sort({ blockNumber: -1 });
-    const startBlock = lastTransfer ? lastTransfer.blockNumber + 1 : 0;
+      console.log("Connected to MongoDB");
+      await createIndexes();
 
-    await indexHistoricalEvents(contract, startBlock);
+      // Initialize provider with timeout and retry options
+      provider = new ethers.JsonRpcProvider(process.env.RPC_URL, {
+        timeout: 30000,
+        retryCount: 3,
+        maxRetries: 5,
+      });
 
-    contract.on("Transfer", async (from, to, tokenId, event) => {
-      try {
-        await processTransferEvent(from, to, tokenId, event);
-      } catch (error) {
-        console.error("Error processing transfer event:", error);
+      contract = new ethers.Contract(
+        process.env.CONTRACT_ADDRESS,
+        contractABI,
+        provider
+      );
+
+      // Get last processed block
+      const lastTransfer = await Transfer.findOne().sort({ blockNumber: -1 });
+      const startBlock = lastTransfer ? lastTransfer.blockNumber + 1 : 0;
+
+      // Index historical events in chunks
+      const latestBlock = await provider.getBlockNumber();
+      const CHUNK_SIZE = 2000;
+
+      for (let from = startBlock; from <= latestBlock; from += CHUNK_SIZE) {
+        const to = Math.min(from + CHUNK_SIZE - 1, latestBlock);
+        await indexHistoricalEvents(contract, from, to);
       }
-    });
-  } catch (error) {
-    console.error("Error in startIndexing:", error);
-    process.exit(1);
+
+      // Set up event listener with reconnection logic
+      setupEventListener(contract);
+
+      // Start periodic tasks
+      startPeriodicTasks(contract);
+
+      break; // Exit loop if successful
+    } catch (error) {
+      console.error("Critical error in startIndexing:", error);
+      await cleanup();
+      // Wait before retrying
+      await new Promise((resolve) => setTimeout(resolve, 10000));
+    }
   }
 }
 
-async function indexHistoricalEvents(contract, fromBlock) {
-  try {
-    const filter = contract.filters.Transfer();
-    const events = await contract.queryFilter(filter, fromBlock);
-
-    for (const event of events) {
-      await processTransferEvent(
-        event.args[0],
-        event.args[1],
-        event.args[2],
-        event
-      );
+function setupEventListener(contract) {
+  contract.on("Transfer", async (from, to, tokenId, event) => {
+    try {
+      await processTransferEvent(from, to, tokenId, event);
+    } catch (error) {
+      console.error("Error processing transfer event:", error);
+      await storeFailedEvent(from, to, tokenId, event, error);
     }
-    console.log(`Indexed ${events.length} historical events`);
-  } catch (error) {
-    console.error("Error indexing historical events:", error);
+  });
+
+  // Handle provider disconnections
+  contract.provider.on("error", async (error) => {
+    console.error("Provider error:", error);
+    await cleanup();
+    setTimeout(() => startIndexing(), 5000);
+  });
+}
+
+function startPeriodicTasks(contract) {
+  // Validate and repair data hourly
+  setInterval(async () => {
+    await validateAndRepairData(contract);
+  }, 3600000);
+
+  // Retry failed events every 5 minutes
+  setInterval(async () => {
+    await retryFailedEvents(contract);
+  }, 300000);
+}
+
+async function indexHistoricalEvents(contract, fromBlock, toBlock) {
+  const retries = 3;
+
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const filter = contract.filters.Transfer();
+      const events = await contract.queryFilter(filter, fromBlock, toBlock);
+
+      for (const event of events) {
+        await processTransferEvent(
+          event.args[0],
+          event.args[1],
+          event.args[2],
+          event
+        );
+      }
+
+      console.log(`Indexed blocks ${fromBlock} to ${toBlock}`);
+      return;
+    } catch (error) {
+      console.error(
+        `Error in attempt ${attempt} for blocks ${fromBlock}-${toBlock}:`,
+        error
+      );
+      if (attempt === retries) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 2000 * attempt));
+    }
   }
 }
 
 async function processTransferEvent(from, to, tokenId, event) {
-  const transfer = new Transfer({
-    tokenId: tokenId.toString(),
-    from: from.toLowerCase(),
-    to: to.toLowerCase(),
-    blockNumber: event.blockNumber,
-    transactionHash: event.transactionHash,
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
+  try {
+    const transfer = new Transfer({
+      tokenId: tokenId.toString(),
+      from: from.toLowerCase(),
+      to: to.toLowerCase(),
+      blockNumber: event.blockNumber,
+      transactionHash: event.transactionHash,
+    });
+
+    await transfer.save({ session });
+
+    await Token.findOneAndUpdate(
+      { tokenId: tokenId.toString() },
+      {
+        tokenId: tokenId.toString(),
+        currentOwner: to.toLowerCase(),
+        lastTransferBlock: event.blockNumber,
+      },
+      { upsert: true, session }
+    );
+
+    await session.commitTransaction();
+    console.log(`Indexed transfer of token ${tokenId} from ${from} to ${to}`);
+  } catch (error) {
+    await session.abortTransaction();
+    throw error;
+  } finally {
+    session.endSession();
+  }
+}
+
+async function storeFailedEvent(from, to, tokenId, event, error) {
+  try {
+    const failedEvent = new FailedEvent({
+      tokenId: tokenId.toString(),
+      from: from.toLowerCase(),
+      to: to.toLowerCase(),
+      blockNumber: event.blockNumber,
+      transactionHash: event.transactionHash,
+      error: error.message,
+    });
+    await failedEvent.save();
+  } catch (storeError) {
+    console.error("Error storing failed event:", storeError);
+  }
+}
+
+async function retryFailedEvents(contract) {
+  const failedEvents = await FailedEvent.find({
+    retryCount: { $lt: 3 },
+    timestamp: { $lt: new Date(Date.now() - 300000) }, // 5 minutes old
   });
 
-  await transfer.save();
+  for (const event of failedEvents) {
+    try {
+      await processTransferEvent(event.from, event.to, event.tokenId, {
+        blockNumber: event.blockNumber,
+        transactionHash: event.transactionHash,
+      });
+      await FailedEvent.findByIdAndDelete(event._id);
+    } catch (error) {
+      await FailedEvent.findByIdAndUpdate(event._id, {
+        $inc: { retryCount: 1 },
+        error: error.message,
+      });
+    }
+  }
+}
 
-  await Token.findOneAndUpdate(
-    { tokenId: tokenId.toString() },
-    {
-      tokenId: tokenId.toString(),
-      currentOwner: to.toLowerCase(),
-      lastTransferBlock: event.blockNumber,
-    },
-    { upsert: true }
-  );
+async function validateAndRepairData(contract) {
+  try {
+    const totalSupply = await contract.totalSupply();
 
-  console.log(`Indexed transfer of token ${tokenId} from ${from} to ${to}`);
+    for (let i = 0; i < totalSupply; i++) {
+      const tokenId = i.toString();
+      const onchainOwner = await contract.ownerOf(tokenId);
+
+      const dbToken = await Token.findOne({ tokenId });
+      if (
+        !dbToken ||
+        dbToken.currentOwner.toLowerCase() !== onchainOwner.toLowerCase()
+      ) {
+        console.log(`Repairing data for token ${tokenId}`);
+        await Token.findOneAndUpdate(
+          { tokenId },
+          {
+            currentOwner: onchainOwner.toLowerCase(),
+            lastTransferBlock: await provider.getBlockNumber(),
+          },
+          { upsert: true }
+        );
+      }
+    }
+  } catch (error) {
+    console.error("Error in validation:", error);
+  }
 }
 
 async function getTokensByOwner(ownerAddress) {
@@ -105,5 +273,26 @@ async function getTokensByOwner(ownerAddress) {
     currentOwner: ownerAddress.toLowerCase(),
   }).select("tokenId");
 }
+
+async function cleanup() {
+  try {
+    if (mongoose.connection.readyState !== 0) {
+      await mongoose.connection.close();
+    }
+  } catch (error) {
+    console.error("Error in cleanup:", error);
+  }
+}
+
+// Graceful shutdown
+process.on("SIGINT", async () => {
+  console.log("Shutting down gracefully...");
+  await cleanup();
+  process.exit(0);
+});
+
+process.on("unhandledRejection", (error) => {
+  console.error("Unhandled promise rejection:", error);
+});
 
 startIndexing().catch(console.error);
